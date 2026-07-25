@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import InputMediaPhoto, InlineKeyboardButton, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image, ImageDraw
-from aiohttp import web  # <-- ВАЖНО: для работы на Render
+from aiohttp import web
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +19,7 @@ dp = Dispatcher()
 
 # Хранилище состояний
 status_messages = {}  # {chat_id: message_id}
+current_status = {}   # {chat_id: color} <-- НОВОЕ: отслеживаем текущий цвет, чтобы не дублировать
 boy_chat_id = None
 chat_locks = {}       # <-- ЗАЩИТА от двойных нажатий (блокировки)
 
@@ -38,27 +39,27 @@ TEXTS = {
 
 COMMENTS = {
     "green": [
-        "💚 Ну наконец-то! Я уже заждалась...",
-        "💚 Ладно, я готова тебя выслушать",
-        "💚 У меня хорошее настроение, не испорти!",
+        "🟢 Ну наконец-то! Я уже заждалась...",
+        "🟢 Ладно, я готова тебя выслушать",
+        "🟢 У меня хорошее настроение, не испорти!",
     ],
     "yellow": [
-        "🤨 можно да, чуть выебу",
-        "😒 Будем или нет покажет время ",
-        "🙄 набери закусимся, иномарка",
+        "🟡 можно да, чуть выебу",
+        "🟡 Будем или нет покажет время ",
+        "🟡 набери закусимся, иномарка",
     ],
     "orange": [
-        "😤 Ты меня уже раздражаешь...",
-        "😒 Всё, я начинаю злиться",
-        "😡 Серьёзно? Опять это?",
-        "😤 Я уже на пределе",
+        "🟠 Ты меня уже раздражаешь...",
+        "🟠 Всё, я начинаю злиться",
+        "🟠 Серьёзно? Опять это?",
+        "🟠 Я уже на пределе",
     ],
     "red": [
         "😡 ВСЁ! Я ОБИДЕЛАСЬ!",
-        "💢 НЕ БЕСИ МЕНЯ!",
-        "😤 Всё, я устала. Отстань.",
-        "💔 Ты меня довел. Поздравляю.",
-        " Даже не Звони мне сейчас!",
+        "🔴 НЕ БЕСИ МЕНЯ!",
+        "🔴 Всё, я устала. Отстань.",
+        "🔴 Ты меня довел. Поздравляю.",
+        "🔴 Даже не Звони мне сейчас!",
     ]
 }
 
@@ -84,17 +85,22 @@ def get_keyboard():
     ).as_markup()
 
 async def get_lock(chat_id: int):
-    """Возвращает асинхронную блокировку для конкретного чата"""
     if chat_id not in chat_locks:
         chat_locks[chat_id] = asyncio.Lock()
     return chat_locks[chat_id]
 
-async def update_girl_photo(chat_id: int, color: str):
-    """ГЛАВНАЯ ФУНКЦИЯ: Гарантирует ОДНО сообщение, даже при бешеных кликах"""
+async def update_girl_photo(chat_id: int, color: str) -> bool:
+    """
+    Возвращает True, только если статус РЕАЛЬНО изменился.
+    """
     lock = await get_lock(chat_id)
     
-    # Блокируем выполнение для этого чата, пока не закончится обработка
     async with lock:
+        # ГЛАВНАЯ ПРОВЕРКА: если цвет тот же самый, ничего не делаем и не шлем парню
+        if current_status.get(chat_id) == color:
+            logger.info(f"ℹ️ Статус для {chat_id} уже {color}, игнорируем повторное нажатие.")
+            return False
+            
         msg_id = status_messages.get(chat_id)
         photo = make_circle(color)
         caption = TEXTS[color]
@@ -108,14 +114,13 @@ async def update_girl_photo(chat_id: int, color: str):
                     media=InputMediaPhoto(media=photo, caption=caption),
                     reply_markup=kb
                 )
-                return  # Успех, выходим
+                current_status[chat_id] = color
+                return True
             except Exception as e:
                 err_str = str(e).lower()
-                
-                # ЕСЛИ СООБЩЕНИЕ НЕ ИЗМЕНИЛОСЬ (тот же цвет), просто игнорируем ошибку!
                 if "not modified" in err_str:
-                    logger.info(f"ℹ️ Сообщение не изменено (тот же статус), игнорируем.")
-                    return
+                    current_status[chat_id] = color
+                    return True
                 
                 logger.warning(f"⚠️ Редактирование не удалось ({e}). Пробую удалить и отправить заново.")
                 try:
@@ -123,7 +128,6 @@ async def update_girl_photo(chat_id: int, color: str):
                 except Exception:
                     pass
 
-        # Отправляем новое, только если редактирование реально провалилось
         try:
             photo = make_circle(color)
             sent = await bot.send_photo(
@@ -133,9 +137,12 @@ async def update_girl_photo(chat_id: int, color: str):
                 reply_markup=kb
             )
             status_messages[chat_id] = sent.message_id
+            current_status[chat_id] = color
             logger.info(f"📤 Отправлено новое фото (msg_id: {sent.message_id}) для {chat_id}")
+            return True
         except Exception as e:
             logger.error(f"❌ Критическая ошибка отправки фото: {e}")
+            return False
 
 @dp.message(Command("start_me"))
 async def start_me(message: types.Message):
@@ -154,11 +161,11 @@ async def on_color_change(callback: types.CallbackQuery):
     color = callback.data
     chat_id = callback.message.chat.id
 
-    # 1. Обновляем фото (теперь это безопасно от двойных кликов)
-    await update_girl_photo(chat_id, color)
+    # 1. Обновляем фото. Функция вернет True, только если статус РЕАЛЬНО изменился
+    is_updated = await update_girl_photo(chat_id, color)
 
-    # 2. Отправляем саркастический комментарий парню
-    if boy_chat_id:
+    # 2. Отправляем саркастический комментарий парню ТОЛЬКО при реальном изменении
+    if is_updated and boy_chat_id:
         try:
             comment = random.choice(COMMENTS[color])
             await bot.send_message(chat_id=boy_chat_id, text=comment)
@@ -166,7 +173,7 @@ async def on_color_change(callback: types.CallbackQuery):
         except Exception as e:
             logger.error(f"❌ Не удалось отправить сообщение парню: {e}")
 
-    # 3. Убираем "часики"
+    # 3. Убираем "часики" загрузки с кнопки
     await callback.answer()
 
 @dp.message(Command("ping"))
@@ -191,7 +198,6 @@ async def init_web_app():
 
 async def main():
     logger.info("🚀 Запуск бота 'Светофор'...")
-    # Запускаем веб-сервер и бота ОДНОВРЕМЕННО
     await asyncio.gather(
         init_web_app(),
         dp.start_polling(bot)
