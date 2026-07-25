@@ -8,23 +8,20 @@ from aiogram.filters import Command
 from aiogram.types import InputMediaPhoto, InlineKeyboardButton, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image, ImageDraw
+from aiohttp import web  # <-- ВАЖНО: для работы на Render
 
-# Токен из переменных окружения Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Инициализация
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # Хранилище состояний
 status_messages = {}  # {chat_id: message_id}
 boy_chat_id = None
+chat_locks = {}       # <-- ЗАЩИТА от двойных нажатий (блокировки)
 
-# Настройки цветов (RGB) и текстов
 COLORS = {
     "green": (0, 200, 0),
     "yellow": (255, 220, 0),
@@ -39,7 +36,6 @@ TEXTS = {
     "red": "🔴 Обиделась!"
 }
 
-# Саркастические комментарии от лица девушки (нарастающее раздражение)
 COMMENTS = {
     "green": [
         "💚 Ну наконец-то! Я уже заждалась...",
@@ -67,27 +63,17 @@ COMMENTS = {
 }
 
 def make_circle(color_name: str) -> BufferedInputFile:
-    """Генерирует круглое фото нужного цвета и возвращает BufferedInputFile"""
     size = 512
-    # Создаем прозрачный фон
     img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    
-    # Рисуем цветной круг
     draw.ellipse([0, 0, size, size], fill=(*COLORS[color_name], 255))
-    # Рисуем белую обводку для красоты
     draw.ellipse([0, 0, size, size], outline=(255, 255, 255, 255), width=12)
-    
-    # Сохраняем в буфер
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     buf.seek(0)
-    
-    # Возвращаем в формате, который понимает aiogram 3.x
     return BufferedInputFile(buf.read(), filename=f"{color_name}_circle.png")
 
 def get_keyboard():
-    """Создает инлайн-клавиатуру"""
     return InlineKeyboardBuilder(
         [
             [InlineKeyboardButton(text="🟢 Зелёная", callback_data="green"),
@@ -97,48 +83,59 @@ def get_keyboard():
         ]
     ).as_markup()
 
-async def update_girl_photo(chat_id: int, color: str):
-    """
-    ГЛАВНАЯ ФУНКЦИЯ: Гарантирует, что в чате девушки ВСЕГДА только одно сообщение.
-    """
-    msg_id = status_messages.get(chat_id)
-    photo = make_circle(color)
-    caption = TEXTS[color]
-    kb = get_keyboard()
+async def get_lock(chat_id: int):
+    """Возвращает асинхронную блокировку для конкретного чата"""
+    if chat_id not in chat_locks:
+        chat_locks[chat_id] = asyncio.Lock()
+    return chat_locks[chat_id]
 
-    # 1. Пытаемся отредактировать существующее сообщение
-    if msg_id:
+async def update_girl_photo(chat_id: int, color: str):
+    """ГЛАВНАЯ ФУНКЦИЯ: Гарантирует ОДНО сообщение, даже при бешеных кликах"""
+    lock = await get_lock(chat_id)
+    
+    # Блокируем выполнение для этого чата, пока не закончится обработка
+    async with lock:
+        msg_id = status_messages.get(chat_id)
+        photo = make_circle(color)
+        caption = TEXTS[color]
+        kb = get_keyboard()
+
+        if msg_id:
+            try:
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    media=InputMediaPhoto(media=photo, caption=caption),
+                    reply_markup=kb
+                )
+                return  # Успех, выходим
+            except Exception as e:
+                err_str = str(e).lower()
+                
+                # ЕСЛИ СООБЩЕНИЕ НЕ ИЗМЕНИЛОСЬ (тот же цвет), просто игнорируем ошибку!
+                if "not modified" in err_str:
+                    logger.info(f"ℹ️ Сообщение не изменено (тот же статус), игнорируем.")
+                    return
+                
+                logger.warning(f"⚠️ Редактирование не удалось ({e}). Пробую удалить и отправить заново.")
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                except Exception:
+                    pass
+
+        # Отправляем новое, только если редактирование реально провалилось
         try:
-            await bot.edit_message_media(
+            photo = make_circle(color)
+            sent = await bot.send_photo(
                 chat_id=chat_id,
-                message_id=msg_id,
-                media=InputMediaPhoto(media=photo, caption=caption),
+                photo=photo,
+                caption=caption,
                 reply_markup=kb
             )
-            logger.info(f"✅ Успешно отредактировано сообщение {msg_id} для {chat_id}")
-            return  # Успех, выходим из функции
+            status_messages[chat_id] = sent.message_id
+            logger.info(f"📤 Отправлено новое фото (msg_id: {sent.message_id}) для {chat_id}")
         except Exception as e:
-            logger.warning(f"⚠️ Редактирование не удалось ({e}). Пробую удалить и отправить заново.")
-            # Пытаемся удалить старое сообщение, чтобы не было дублей
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except Exception:
-                pass  # Игнорируем ошибку удаления, если сообщения уже нет
-
-    # 2. Если редактирование не удалось или сообщения не было — отправляем новое
-    try:
-        # Пересоздаем фото, так как предыдущий буфер мог быть прочитан
-        photo = make_circle(color)
-        sent = await bot.send_photo(
-            chat_id=chat_id,
-            photo=photo,
-            caption=caption,
-            reply_markup=kb
-        )
-        status_messages[chat_id] = sent.message_id
-        logger.info(f"📤 Отправлено новое фото (msg_id: {sent.message_id}) для {chat_id}")
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка отправки фото: {e}")
+            logger.error(f"❌ Критическая ошибка отправки фото: {e}")
 
 @dp.message(Command("start_me"))
 async def start_me(message: types.Message):
@@ -149,7 +146,6 @@ async def start_me(message: types.Message):
 
 @dp.message(Command("start"))
 async def start_girl(message: types.Message):
-    # Сразу отправляем/обновляем фото на зелёный статус
     await update_girl_photo(message.chat.id, "green")
     logger.info(f"🎬 Девушка запустила бота: {message.chat.id}")
 
@@ -158,32 +154,48 @@ async def on_color_change(callback: types.CallbackQuery):
     color = callback.data
     chat_id = callback.message.chat.id
 
-    # 1. Обновляем фото у девушки (гарантированно одно сообщение)
+    # 1. Обновляем фото (теперь это безопасно от двойных кликов)
     await update_girl_photo(chat_id, color)
 
     # 2. Отправляем саркастический комментарий парню
     if boy_chat_id:
         try:
             comment = random.choice(COMMENTS[color])
-            await bot.send_message(
-                chat_id=boy_chat_id,
-                text=comment,
-                parse_mode="Markdown"
-            )
+            await bot.send_message(chat_id=boy_chat_id, text=comment)
             logger.info(f"📩 Отправлен комментарий парню: {comment}")
         except Exception as e:
             logger.error(f"❌ Не удалось отправить сообщение парню: {e}")
 
-    # 3. Убираем "часики" загрузки с кнопки
+    # 3. Убираем "часики"
     await callback.answer()
 
 @dp.message(Command("ping"))
 async def ping(message: types.Message):
-    await message.answer("🏓 Понг! Бот работает и генерирует круги.")
+    await message.answer("🏓 Понг! Бот работает.")
+
+# ==========================================
+# ФИКС ДЛЯ RENDER: Фиктивный веб-сервер
+# ==========================================
+async def handle_health(request):
+    return web.Response(text="Bot is running 🟢")
+
+async def init_web_app():
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"✅ Веб-сервер запущен на порту {port} (Render happy)")
 
 async def main():
     logger.info("🚀 Запуск бота 'Светофор'...")
-    await dp.start_polling(bot)
+    # Запускаем веб-сервер и бота ОДНОВРЕМЕННО
+    await asyncio.gather(
+        init_web_app(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
