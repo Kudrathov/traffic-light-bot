@@ -2,24 +2,29 @@ import os
 import asyncio
 import logging
 import random
+import io
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InputMediaPhoto, InlineKeyboardButton
+from aiogram.types import InputMediaPhoto, InlineKeyboardButton, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image, ImageDraw
-import io
 
+# Токен из переменных окружения Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Инициализация
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище: {chat_id: message_id}
-status_messages = {}
+# Хранилище состояний
+status_messages = {}  # {chat_id: message_id}
 boy_chat_id = None
 
+# Настройки цветов (RGB) и текстов
 COLORS = {
     "green": (0, 200, 0),
     "yellow": (255, 220, 0),
@@ -29,11 +34,12 @@ COLORS = {
 
 TEXTS = {
     "green": "💚 Готова общаться",
-    "yellow": " Думаю...",
-    "orange": " Раздражаюсь...",
+    "yellow": "🤔 Можно...",
+    "orange": "😤 Раздражаюсь...",
     "red": "🔴 Обиделась!"
 }
 
+# Саркастические комментарии от лица девушки (нарастающее раздражение)
 COMMENTS = {
     "green": [
         "💚 Ну наконец-то! Я уже заждалась...",
@@ -60,19 +66,28 @@ COMMENTS = {
     ]
 }
 
-def make_circle(color_name: str) -> io.BytesIO:
-    """Создаёт круглое фото (каждый раз новое, т.к. BytesIO одноразовый)"""
+def make_circle(color_name: str) -> BufferedInputFile:
+    """Генерирует круглое фото нужного цвета и возвращает BufferedInputFile"""
     size = 512
+    # Создаем прозрачный фон
     img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+    
+    # Рисуем цветной круг
     draw.ellipse([0, 0, size, size], fill=(*COLORS[color_name], 255))
+    # Рисуем белую обводку для красоты
     draw.ellipse([0, 0, size, size], outline=(255, 255, 255, 255), width=12)
+    
+    # Сохраняем в буфер
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     buf.seek(0)
-    return buf
+    
+    # Возвращаем в формате, который понимает aiogram 3.x
+    return BufferedInputFile(buf.read(), filename=f"{color_name}_circle.png")
 
-def keyboard():
+def get_keyboard():
+    """Создает инлайн-клавиатуру"""
     return InlineKeyboardBuilder(
         [
             [InlineKeyboardButton(text="🟢 Зелёная", callback_data="green"),
@@ -83,13 +98,15 @@ def keyboard():
     ).as_markup()
 
 async def update_girl_photo(chat_id: int, color: str):
-    """ГЛАВНАЯ ФУНКЦИЯ: гарантирует ОДНО сообщение в чате"""
+    """
+    ГЛАВНАЯ ФУНКЦИЯ: Гарантирует, что в чате девушки ВСЕГДА только одно сообщение.
+    """
     msg_id = status_messages.get(chat_id)
     photo = make_circle(color)
     caption = TEXTS[color]
-    kb = keyboard()
+    kb = get_keyboard()
 
-    # 1. Пытаемся отредактировать существующее
+    # 1. Пытаемся отредактировать существующее сообщение
     if msg_id:
         try:
             await bot.edit_message_media(
@@ -98,19 +115,20 @@ async def update_girl_photo(chat_id: int, color: str):
                 media=InputMediaPhoto(media=photo, caption=caption),
                 reply_markup=kb
             )
-            logger.info(f"✅ Отредактировано msg {msg_id} для {chat_id}")
-            return  # Успех — выходим
+            logger.info(f"✅ Успешно отредактировано сообщение {msg_id} для {chat_id}")
+            return  # Успех, выходим из функции
         except Exception as e:
-            logger.warning(f"Edit не удался: {e}. Пробую удалить и отправить новое.")
-            # Удаляем старое (если есть)
+            logger.warning(f"⚠️ Редактирование не удалось ({e}). Пробую удалить и отправить заново.")
+            # Пытаемся удалить старое сообщение, чтобы не было дублей
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except Exception:
-                pass
+                pass  # Игнорируем ошибку удаления, если сообщения уже нет
 
-    # 2. Отправляем новое фото
+    # 2. Если редактирование не удалось или сообщения не было — отправляем новое
     try:
-        photo = make_circle(color)  # Пересоздаём, т.к. старый BytesIO уже прочитан
+        # Пересоздаем фото, так как предыдущий буфер мог быть прочитан
+        photo = make_circle(color)
         sent = await bot.send_photo(
             chat_id=chat_id,
             photo=photo,
@@ -118,46 +136,53 @@ async def update_girl_photo(chat_id: int, color: str):
             reply_markup=kb
         )
         status_messages[chat_id] = sent.message_id
-        logger.info(f"📤 Отправлено новое фото msg {sent.message_id} для {chat_id}")
+        logger.info(f"📤 Отправлено новое фото (msg_id: {sent.message_id}) для {chat_id}")
     except Exception as e:
-        logger.error(f"Критическая ошибка отправки: {e}")
+        logger.error(f"❌ Критическая ошибка отправки фото: {e}")
 
 @dp.message(Command("start_me"))
 async def start_me(message: types.Message):
     global boy_chat_id
     boy_chat_id = message.chat.id
-    await message.answer("✅ Твой ID сохранён! Буду слать тебе её настроение 😏")
-    logger.info(f"Парень: {message.chat.id}")
+    await message.answer("✅ Твой ID сохранён! Теперь будешь получать уведомления о её настроении 😏")
+    logger.info(f"💾 Сохранён ID парня: {message.chat.id}")
 
 @dp.message(Command("start"))
 async def start_girl(message: types.Message):
+    # Сразу отправляем/обновляем фото на зелёный статус
     await update_girl_photo(message.chat.id, "green")
-    await message.answer("Выбирай настроение 👇")
+    logger.info(f"🎬 Девушка запустила бота: {message.chat.id}")
 
 @dp.callback_query(F.data.in_(["green", "yellow", "orange", "red"]))
-async def on_color(callback: types.CallbackQuery):
+async def on_color_change(callback: types.CallbackQuery):
     color = callback.data
     chat_id = callback.message.chat.id
 
-    # Обновляем фото у девушки (всегда одно сообщение!)
+    # 1. Обновляем фото у девушки (гарантированно одно сообщение)
     await update_girl_photo(chat_id, color)
 
-    # Сарказм парню
+    # 2. Отправляем саркастический комментарий парню
     if boy_chat_id:
         try:
-            text = random.choice(COMMENTS[color])
-            await bot.send_message(chat_id=boy_chat_id, text=text)
+            comment = random.choice(COMMENTS[color])
+            await bot.send_message(
+                chat_id=boy_chat_id,
+                text=comment,
+                parse_mode="Markdown"
+            )
+            logger.info(f"📩 Отправлен комментарий парню: {comment}")
         except Exception as e:
-            logger.error(f"Парню не отправлено: {e}")
+            logger.error(f"❌ Не удалось отправить сообщение парню: {e}")
 
+    # 3. Убираем "часики" загрузки с кнопки
     await callback.answer()
 
 @dp.message(Command("ping"))
 async def ping(message: types.Message):
-    await message.answer("🏓 Жив!")
+    await message.answer("🏓 Понг! Бот работает и генерирует круги.")
 
 async def main():
-    logger.info("Запуск...")
+    logger.info("🚀 Запуск бота 'Светофор'...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
